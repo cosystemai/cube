@@ -34,6 +34,12 @@ permissions:
   contents: read
   packages: write
 
+# Two pushes in a row must not race to publish the same moving tag: the loser
+# would win the registry and the tag would name the older build.
+concurrency:
+  group: cube-image-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   IMAGE: ghcr.io/teamiumai/cube
   TAG: cve-update
