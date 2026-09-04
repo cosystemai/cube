@@ -1,0 +1,141 @@
+# Publish the CVE-rebased Cube image to GHCR.
+#
+# Why this exists: Teamium's semantic layer (ANA-006) builds its container FROM
+# this image. Building it on a laptop produced an arm64-only tag that
+# Cloudflare's amd64 container build could not use — the base has to exist in a
+# registry, for both architectures, built somewhere reproducible.
+#
+# It is a deliberately narrow sibling of upstream's `publish.yml`: same context
+# (`packages/cubejs-docker` with the root lock file copied in, which is how the
+# resolutions in that package's `package.json` take effect), same Dockerfile,
+# same `IMAGE_VERSION` build arg — but pushed to GHCR under this fork rather
+# than to Docker Hub under upstream's account, and triggered only by this
+# branch rather than by release tags.
+#
+# One native runner per architecture rather than one runner emulating the
+# other: this image's build is a `yarn install --prod` over ~30 drivers, and
+# under QEMU that is the difference between minutes and an hour. Each leg
+# pushes by digest and the merge job assembles the multi-architecture tag, so
+# `docker pull` serves amd64 to Cloudflare and arm64 to an Apple-silicon
+# laptop from the same name.
+name: Cube image (CVE re-base)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cve-update
+    paths:
+      - ".github/workflows/cube-image.yml"
+      - "packages/cubejs-docker/**"
+      - "yarn.lock"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/teamiumai/cube
+  TAG: cve-update
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      # One architecture failing must not throw away the other: amd64 alone is
+      # enough to unblock a Cloudflare deploy, and the merge job below builds
+      # the tag from whichever digests arrived.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            slug: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Upstream's publish job does exactly this, and it is load-bearing: the
+      # Dockerfile's `yarn install --prod` runs in `packages/cubejs-docker`,
+      # and the root lock file is what pins the tree that the package's
+      # `resolutions` then float forward past their advisories.
+      - name: Copy the root lock file into the build context
+        run: cp yarn.lock packages/cubejs-docker/
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./packages/cubejs-docker
+          file: ./packages/cubejs-docker/latest.Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            IMAGE_VERSION=${{ env.TAG }}-${{ github.sha }}
+          # Push by digest and assemble the tag once, in `merge`. Provenance
+          # attestations are off because they add manifest entries that
+          # `imagetools create` would carry into the final index for no gain
+          # here.
+          provenance: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Record the digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.slug }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  merge:
+    name: multi-architecture tag
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble and verify the tag
+        run: |
+          set -euo pipefail
+          refs=""
+          for file in /tmp/digests/*; do
+            refs="$refs ${IMAGE}@$(cat "$file")"
+          done
+          if [ -z "$refs" ]; then
+            echo "no digests were produced — both build legs failed" >&2
+            exit 1
+          fi
+          # The moving tag and an immutable one. A deploy pins the moving tag;
+          # the commit tag is what an operator names when asking which build a
+          # container is actually running.
+          docker buildx imagetools create \
+            -t "${IMAGE}:${TAG}" \
+            -t "${IMAGE}:${TAG}-${GITHUB_SHA::12}" \
+            $refs
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
