@@ -1,6 +1,6 @@
 # Publish the CVE-rebased Cube image to GHCR.
 #
-# Why this exists: Teamium's semantic layer (ANA-006) builds its container FROM
+# Why this exists: CoSystem's semantic layer (ANA-006) builds its container FROM
 # this image. Building it on a laptop produced an arm64-only tag that
 # Cloudflare's amd64 container build could not use — the base has to exist in a
 # registry, for both architectures, built somewhere reproducible.
@@ -41,7 +41,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/teamiumai/cube
+  IMAGE: ghcr.io/cosystemai/cube
   TAG: cve-update
 
 jobs:
